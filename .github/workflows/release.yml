@@ -118,10 +118,29 @@ jobs:
             .release-package/current.json
           # Draft releases are absent from the release-by-tag endpoint. Resolve
           # the exact draft from the authenticated list before comparing assets.
-          releases_json="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
-          release_id="$(jq -er --arg tag "$tag" --arg target "$target_sha" \
-            '[.[] | select(.tag_name == $tag and .draft == true and .target_commitish == $target)] | if length == 1 then .[0].id else error("expected exactly one matching draft release") end' \
-            <<<"$releases_json")"
+          release_id=""
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            releases_json="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+            matches="$(jq -c --arg tag "$tag" --arg target "$target_sha" \
+              '[.[] | select(.tag_name == $tag and .draft == true and .target_commitish == $target)]' \
+              <<<"$releases_json")"
+            match_count="$(jq length <<<"$matches")"
+            if [ "$match_count" -gt 1 ]; then
+              echo "Found multiple matching draft releases for $tag at $target_sha." >&2
+              exit 1
+            fi
+            if [ "$match_count" -eq 1 ]; then
+              release_id="$(jq -r '.[0].id' <<<"$matches")"
+              break
+            fi
+            if [ "$attempt" -lt 30 ]; then
+              sleep 2
+            fi
+          done
+          if [ -z "$release_id" ]; then
+            echo "Draft release $tag at $target_sha did not become visible." >&2
+            exit 1
+          fi
           printf '%s\n' "$tag" > release-tag.txt
           printf 'id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
 
@@ -162,9 +181,23 @@ jobs:
           test "$(jq -r .tag_name <<<"$release_json")" = "$tag"
           test "$(jq -r .target_commitish <<<"$release_json")" = "$target_sha"
           test "$(jq -r .draft <<<"$release_json")" = "false"
-          test "$(jq -r .immutable <<<"$release_json")" = "true"
-          published_id="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id)"
-          test "$published_id" = "$release_id"
+          published=false
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            if published_json="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null)"; then
+              if [ "$(jq -r .id <<<"$published_json")" = "$release_id" ] &&
+                [ "$(jq -r .immutable <<<"$published_json")" = "true" ]; then
+                published=true
+                break
+              fi
+            fi
+            if [ "$attempt" -lt 30 ]; then
+              sleep 2
+            fi
+          done
+          if [ "$published" != "true" ]; then
+            echo "Published release $tag did not become visible as immutable." >&2
+            exit 1
+          fi
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       - name: Verify public download from a clean cache
@@ -172,7 +205,17 @@ jobs:
         env:
           GOMONTY_CACHE_DIR: ${{ runner.temp }}/published-runtime-cache
         run: |
-          go run ./cmd/gomonty prepare download --json
+          prepared=false
+          for ((attempt = 1; attempt <= 15; attempt++)); do
+            if go run ./cmd/gomonty prepare download --json; then
+              prepared=true
+              break
+            fi
+            if [ "$attempt" -lt 15 ]; then
+              sleep 2
+            fi
+          done
+          test "$prepared" = "true"
           cd examples
           CGO_ENABLED=0 go run ./cmd/example
 
