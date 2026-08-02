@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/ewhauser/gomonty/internal/ffi"
+	"github.com/regularkevvv/gomonty/internal/ffi"
 )
 
 // Frame is a structured traceback frame returned by runtime and syntax errors.
@@ -29,6 +29,14 @@ type errorSummary struct {
 type baseError struct {
 	summary errorSummary
 	handle  *ffi.Error
+	cause   error
+}
+
+func (e *baseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 func (e *baseError) Error() string {
@@ -94,6 +102,7 @@ func newError(err *ffi.Error) error {
 	base := baseError{
 		summary: summary,
 		handle:  err,
+		cause:   err.Cause(),
 	}
 
 	switch summary.Kind {
